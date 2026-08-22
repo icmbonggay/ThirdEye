@@ -30,17 +30,26 @@ while True:
             print("Lost connection to CCTV. Program will exit now...")
             break    
 
-    results = model.track(frame, tracker = "bytetrack.yaml")
+    results = model.track(frame, tracker = "bytetrack.yaml", persist = True)
 
     for result in results:
         for box in result.boxes:
             conf = float(box.conf[0])
             label = result.names[int(box.cls)]
-            if  label == 'dog' and conf >= 0.3:
+            if  label == 'person' and conf >= 0.3:
                 x1, y1, x2, y2 = map(int, box.xyxy[0])
                 cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
                 cv2.putText(frame, label, (x1, y1 - 10),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+
+                if box.id is not None:
+                    track_id = int(box.id[0])
+                    x = int((x1 + x2) / 2)
+                    y = int(y2)
+                    lower_box = (x, y)
+                    print(f"Box {(x1, y1, x2, y2)} has Track ID: {track_id}")
+                    print(f"Lower Box: {lower_box}")
+                          
 
     cv2.imshow('Live Dog Detection', frame)
     if cv2.waitKey(1) & 0xFF == ord('q'):
