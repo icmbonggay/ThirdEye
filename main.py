@@ -1,109 +1,192 @@
-import os
-# pyrefly: ignore [missing-import]
-import cv2
-import time
+"""Third-Eye: watch a camera, track the pet, and log what it's doing and where.
+
+Usage:
+    python main.py                      # camera from variables.env, with a preview window
+    python main.py --headless           # no window (e.g. running on a server)
+    python main.py --source clip.mp4    # test on a recorded video
+    python main.py --source 0           # test on the laptop webcam
+"""
+import argparse
+import csv
+import logging
 import math
-# pyrefly: ignore [missing-import]
+import os
+import time
+
+import cv2
 from ultralytics import YOLO
-from dotenv import load_dotenv
 
-load_dotenv("variables.env")
+from activity import MotionHistory, StateDebouncer, TrackState, classify, describe
+from config import Settings, pick_device, redact
+from stream import FrameReader
+from zones import draw_zones, find_zone, load_zones
 
-model = YOLO('yolov8n.pt')
-USERNAME = os.environ.get("CAM_USERNAME")
-PASSWORD = os.environ.get("PASSWORD")
-IP_ADDRESS = os.environ.get("IP_ADDRESS")
-rtsp = f"rtsp://{USERNAME}:{PASSWORD}@{IP_ADDRESS}:554/stream1"
+log = logging.getLogger("third-eye")
 
-cap = cv2.VideoCapture(rtsp)
-counter = 0
+BOX_COLOR = (0, 0, 255)
+MAX_PREVIEW_WIDTH = 1280
+WINDOW_NAME = "Live Dog Detection"
 
-zones = {
-    "zones": [
-        {"name": "food zone", "x_min": 20, "y_min": 700, "x_max": 300, "y_max": 1500, "still_label": "eating"},
-        {"name": "bed zone", "x_min": 560, "y_min": 200, "x_max": 1300, "y_max": 700, "still_label": "resting"},
-        {"name": "sofa zone", "x_min": 1600, "y_min": 200, "x_max": 1800, "y_max": 1000, "still_label": "resting"},
-    ]
-}
 
-previous_positions = {}
-last_logged_state = {} 
-last_log_time = {}       
-HEARTBEAT_SECONDS = 600  
+def parse_args():
+    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("--source", help="Video file, webcam index or RTSP URL (overrides variables.env)")
+    p.add_argument("--env", default="variables.env", help="Settings file (default: variables.env)")
+    p.add_argument("--headless", action="store_true", help="Don't open a preview window")
+    p.add_argument("--save-video", metavar="PATH", help="Write the annotated video to this file")
+    return p.parse_args()
 
-while True:
-    success, frame = cap.read()
-    if not success:
-        while counter < 4:
-            cap = cv2.VideoCapture(rtsp)
-            success, frame = cap.read()
-            if success:
-                counter = 0
+
+class ActivityLog:
+    """Append-only CSV activity log."""
+
+    FIELDS = ["timestamp", "track_id", "label", "activity", "zone", "speed", "reason", "description"]
+
+    def __init__(self, path):
+        new_file = not os.path.exists(path) or os.path.getsize(path) == 0
+        self._file = open(path, "a", newline="")
+        self._writer = csv.writer(self._file)
+        if new_file:
+            self._writer.writerow(self.FIELDS)
+            self._file.flush()
+
+    def write(self, ts, track_id, label, state, speed, reason):
+        activity, zone_name = state
+        stamp = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(ts))
+        self._writer.writerow([stamp, track_id, label, activity, zone_name or "",
+                               f"{speed:.3f}", reason, describe(label, state)])
+        self._file.flush()
+        log.info("%s  #%d  %s (%s)", stamp, track_id, describe(label, state), reason)
+
+    def close(self):
+        self._file.close()
+
+
+def resolve_class_id(model, name):
+    for class_id, class_name in model.names.items():
+        if class_name == name:
+            return class_id
+    raise SystemExit(f"'{name}' is not a class this model knows. Options: {sorted(model.names.values())}")
+
+
+def annotate(frame, box, track_id, text):
+    x1, y1, x2, y2 = box
+    cv2.rectangle(frame, (x1, y1), (x2, y2), BOX_COLOR, 2)
+    cv2.circle(frame, ((x1 + x2) // 2, y2), 5, BOX_COLOR, -1)  # zone reference point
+    label = f"#{track_id} {text}"
+    (w, h), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2)
+    top = max(y1 - h - 10, 0)
+    cv2.rectangle(frame, (x1, top), (x1 + w + 6, top + h + 10), BOX_COLOR, -1)
+    cv2.putText(frame, label, (x1 + 3, top + h + 4), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+
+
+def main():
+    args = parse_args()
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s", datefmt="%H:%M:%S")
+    settings = Settings.from_env(args.env, source=args.source)
+
+    device = pick_device(settings.device)
+    model = YOLO(settings.model_path)
+    class_id = resolve_class_id(model, settings.target_class)
+    label = settings.target_class
+    log.info("Source: %s | model: %s | device: %s | tracking: %s",
+             redact(settings.source), settings.model_path, device, label)
+
+    reader = FrameReader(settings.source, rtsp_transport=settings.rtsp_transport).start()
+    activity_log = ActivityLog(settings.log_path)
+    tracks = {}
+    zones = None
+    writer = None
+    fps_avg = None
+    last_tick = time.time()
+
+    try:
+        while True:
+            frame, ts = reader.read()
+            if frame is None:
                 break
-            counter += 1
-            time.sleep(30)
-        else:
-            print("Lost connection to CCTV. Program will exit now...")
-            break
 
-    results = model.track(frame, tracker="bytetrack.yaml", persist=True)
+            if zones is None:  # loaded on the first frame to match its resolution
+                h, w = frame.shape[:2]
+                if os.path.exists(settings.zones_path):
+                    zones = load_zones(settings.zones_path, frame_size=(w, h))
+                else:
+                    log.warning("%s not found, running without zones (create it with find_coordinates.py)",
+                                settings.zones_path)
+                    zones = []
 
-    for result in results:
-        for box in result.boxes:
-            conf = float(box.conf[0])
-            label = result.names[int(box.cls)]
-            if label == 'person' and conf > 0.5:
-                x1, y1, x2, y2 = map(int, box.xyxy[0])
-                cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 0, 255), 2)
+            result = model.track(frame, persist=True, tracker=settings.tracker, classes=[class_id],
+                                 conf=settings.confidence, device=device, verbose=False)[0]
 
-                if box.id is not None:
-                    track_id = int(box.id[0])
-                    x = int((x1 + x2) / 2)
-                    y = int(y2)
-                    lower_box = (x, y)
-                    print(f"Box {(x1, y1, x2, y2)} has Track ID: {track_id}")
-                    print(f"Lower Box: {lower_box}")
+            draw_zones(frame, zones)
+            boxes = result.boxes
+            if boxes is not None and boxes.id is not None:
+                for xyxy, track_id in zip(boxes.xyxy.int().tolist(), boxes.id.int().tolist()):
+                    x1, y1, x2, y2 = xyxy
+                    foot = ((x1 + x2) // 2, y2)  # bottom-centre of the box
+                    scale = math.sqrt(max((x2 - x1) * (y2 - y1), 1))
 
-                    last_seen = previous_positions.get(track_id)
-                    previous_positions.update({track_id: (x, y, time.time())})
+                    track = tracks.get(track_id)
+                    if track is None:
+                        track = tracks[track_id] = TrackState(
+                            MotionHistory(settings.motion_window), StateDebouncer(settings.state_hold))
+                    track.history.add(ts, foot[0], foot[1], scale)
 
-                    if last_seen is not None:
-                        prev_x, prev_y, prev_time = last_seen
-                        distance = math.dist((prev_x, prev_y), (x, y))
-                        elapsed = time.time() - prev_time
-                        speed = distance / elapsed if elapsed > 0 else 0
-                    else:
-                        speed = 0
+                    speed = track.history.speed()
+                    if speed is None:
+                        annotate(frame, xyxy, track_id, "watching...")
+                        continue
 
-                    print(f"Speed: {speed:.1f} px/sec")
+                    zone = find_zone(zones, foot)
+                    changed = track.debouncer.update(classify(speed, zone, settings.still_threshold), ts)
+                    state = track.debouncer.state
+                    if changed:
+                        activity_log.write(ts, track_id, label, state, speed, "change")
+                        track.last_logged = ts
+                    elif ts - track.last_logged >= settings.heartbeat_seconds:
+                        activity_log.write(ts, track_id, label, state, speed, "heartbeat")
+                        track.last_logged = ts
 
-                    mode = "resting" if speed < 20 else "active"
+                    annotate(frame, xyxy, track_id, f"{describe(label, state)} ({speed:.2f})")
 
-                    matched_zone = f"{label.capitalize()} is {mode}"
-                    for zone in zones["zones"]:
-                        if (lower_box[0] >= zone["x_min"] and lower_box[0] <= zone["x_max"] and
-                                lower_box[1] >= zone["y_min"] and lower_box[1] <= zone["y_max"]):
-                            zone_mode = zone["still_label"] if speed < 20 else "active"
-                            matched_zone = f"{label.capitalize()} is {zone_mode} in {zone['name']}"
-                            break
+            # Remove tracks not seen within TRACK_TTL seconds.
+            for tid in [t for t, s in tracks.items() if ts - s.history.last_seen > settings.track_ttl]:
+                del tracks[tid]
 
-                    now = time.time()
-                    state_changed = last_logged_state.get(track_id) != matched_zone
-                    heartbeat_due = now - last_log_time.get(track_id, 0) >= HEARTBEAT_SECONDS
+            now = time.time()
+            inst = 1.0 / max(now - last_tick, 1e-6)
+            fps_avg = inst if fps_avg is None else 0.9 * fps_avg + 0.1 * inst
+            last_tick = now
+            cv2.putText(frame, f"{fps_avg:.1f} FPS", (10, frame.shape[0] - 15),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
 
-                    if state_changed or heartbeat_due:
-                        with open("log.txt", "a") as file:
-                            file.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')}: {matched_zone}\n")
-                        last_logged_state[track_id] = matched_zone
-                        last_log_time[track_id] = now
+            if args.save_video:
+                if writer is None:
+                    h, w = frame.shape[:2]
+                    writer = cv2.VideoWriter(args.save_video, cv2.VideoWriter_fourcc(*"mp4v"),
+                                             reader.fps or 15, (w, h))
+                writer.write(frame)
 
-                    cv2.putText(frame, matched_zone, (x1, y1 - 10),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
+            if not args.headless:
+                h, w = frame.shape[:2]
+                if w > MAX_PREVIEW_WIDTH:
+                    frame = cv2.resize(frame, (MAX_PREVIEW_WIDTH, int(h * MAX_PREVIEW_WIDTH / w)))
+                cv2.imshow(WINDOW_NAME, frame)
+                if cv2.waitKey(1) & 0xFF == ord("q"):  # press 'q' to quit
+                    break
+    except KeyboardInterrupt:
+        pass
+    finally:
+        reader.stop()
+        activity_log.close()
+        if writer is not None:
+            writer.release()
+        if not args.headless:
+            cv2.destroyAllWindows()
 
-    cv2.imshow('Live Dog Detection', frame)
-    # click 'q' on keyboard to exit
-    if cv2.waitKey(1) & 0xFF == ord('q'):
-        break
+    if reader.failed:
+        raise SystemExit(1)
 
-cap.release()
-cv2.destroyAllWindows()
+
+if __name__ == "__main__":
+    main()

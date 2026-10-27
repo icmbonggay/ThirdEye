@@ -3,3 +3,10 @@ variables.env
 yolov8/
 __pycache__/
 *.pyc
+.pytest_cache/
+
+# Runtime output
+activity_log.csv
+log.txt
+*.mp4
+runs/

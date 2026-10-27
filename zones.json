@@ -1,0 +1,24 @@
+{
+  "frame_width": 1920,
+  "frame_height": 1080,
+  "zones": [
+    {
+      "name": "food zone",
+      "still_label": "eating",
+      "points": [[20, 700], [300, 700], [300, 1079], [20, 1079]],
+      "color": [0, 200, 255]
+    },
+    {
+      "name": "bed zone",
+      "still_label": "resting",
+      "points": [[560, 200], [1300, 200], [1300, 700], [560, 700]],
+      "color": [255, 160, 0]
+    },
+    {
+      "name": "sofa zone",
+      "still_label": "resting",
+      "points": [[1600, 200], [1800, 200], [1800, 1000], [1600, 1000]],
+      "color": [180, 0, 255]
+    }
+  ]
+}
